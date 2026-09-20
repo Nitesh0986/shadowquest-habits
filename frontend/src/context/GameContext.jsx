@@ -1,26 +1,41 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import api, { TOKEN_KEY, AUTH_EXPIRED_EVENT, apiMessage } from "../api/client.js";
 import { InsufficientGoldModal, LevelUpModal } from "../components/CelebrationModal.jsx";
+import {
+  loadStoredData,
+  saveStoredData,
+  initSession,
+  clearSession,
+  deleteLocalAccount,
+  applyLazyResets,
+  formatQuest,
+  formatPlayer,
+  computeWeek,
+  formatShop,
+  formatBadges,
+  formatActivity,
+} from "../lib/game-engine/localStore.js";
+import { dayKey } from "../lib/game-engine/dates.js";
+import { applyCompletion } from "../lib/game-engine/streak.js";
+import { newlyUnlocked } from "../lib/game-engine/badges.js";
+import { addXp } from "../lib/game-engine/xpCurve.js";
+import { rewardFor } from "../lib/game-engine/economy.js";
+import { getFrame } from "../lib/game-engine/frames.js";
 
 const GameContext = createContext(null);
 
 const emptyWeek = { bars: [], today: { day: "Today", count: 0, value: 0 }, weekDone: 0, total: 0 };
+const TOKEN_KEY = "shadowquest_token";
 
 export function GameProvider({ children }) {
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY));
-  const [player, setPlayer] = useState(null);
-  const [quests, setQuests] = useState([]);
-  const [activity, setActivity] = useState([]);
-  const [badges, setBadges] = useState([]);
-  const [shopItems, setShopItems] = useState([]);
-  const [week, setWeek] = useState(emptyWeek);
+  const [rawPlayer, setRawPlayer] = useState(null);
+  const [rawQuests, setRawQuests] = useState([]);
+  const [rawActivity, setRawActivity] = useState([]);
   const [toasts, setToasts] = useState([]);
-  const [ready, setReady] = useState(false); // finished checking for a stored session
+  const [ready, setReady] = useState(false);
   const [goldModalItem, setGoldModalItem] = useState(null);
   const [levelUpModalLevel, setLevelUpModalLevel] = useState(null);
   const nextId = useRef(100);
-  const pendingPatch = useRef({});
-  const patchTimer = useRef(null);
 
   function id() {
     nextId.current += 1;
@@ -29,7 +44,6 @@ export function GameProvider({ children }) {
 
   function toast(text, kind = "success", badge = null) {
     const toastId = id();
-    // Badge toasts stay a little longer so there is time to see the medal.
     const duration = kind === "badge" ? 4400 : 2600;
     setToasts((list) => [...list, { id: toastId, text, kind, badge }]);
     setTimeout(() => setToasts((list) => list.filter((t) => t.id !== toastId)), duration);
@@ -40,206 +54,295 @@ export function GameProvider({ children }) {
   }
 
   function resetGameState() {
-    setPlayer(null);
-    setQuests([]);
-    setActivity([]);
-    setBadges([]);
-    setShopItems([]);
-    setWeek(emptyWeek);
+    setRawPlayer(null);
+    setRawQuests([]);
+    setRawActivity([]);
     setGoldModalItem(null);
     setLevelUpModalLevel(null);
   }
 
+  // Load session on startup
+  useEffect(() => {
+    if (!token) {
+      resetGameState();
+      setReady(true);
+      return;
+    }
+
+    const data = loadStoredData();
+    if (!data.player) {
+      // Initialize with demo user if token is present but data was cleared
+      const seeded = initSession("demo@shadowquest.test", "Aris Hollow");
+      setRawPlayer(seeded.player);
+      setRawQuests(seeded.quests);
+      setRawActivity(seeded.activity);
+    } else {
+      const tz = data.player.timezone || "UTC";
+      const resetQuests = applyLazyResets(data.quests, tz);
+      setRawPlayer(data.player);
+      setRawQuests(resetQuests);
+      setRawActivity(data.activity);
+      saveStoredData({ quests: resetQuests });
+    }
+    setReady(true);
+  }, [token]);
+
+  // Derived state for the UI
+  const tz = rawPlayer?.timezone || "UTC";
+  const player = rawPlayer ? formatPlayer(rawPlayer, rawActivity) : null;
+  const quests = rawQuests.map((q) => formatQuest(q, tz));
+  const activity = formatActivity(rawActivity, tz);
+  const badges = formatBadges(rawPlayer);
+  const shopItems = formatShop(rawPlayer);
+  const week = rawPlayer ? computeWeek(rawActivity, tz) : emptyWeek;
+
+  // Actions
+  function signup({ name, email, password }) {
+    const seeded = initSession(email, name);
+    setRawPlayer(seeded.player);
+    setRawQuests(seeded.quests);
+    setRawActivity(seeded.activity);
+    localStorage.setItem(TOKEN_KEY, "session_active");
+    setToken("session_active");
+    toast(`Welcome, ${name}!`);
+  }
+
+  function login({ email, password }) {
+    const data = loadStoredData();
+    let p = data.player;
+    let q = data.quests;
+    let a = data.activity;
+
+    if (!p || (email && p.email !== email)) {
+      const seeded = initSession(email || "demo@shadowquest.test", "Aris Hollow");
+      p = seeded.player;
+      q = seeded.quests;
+      a = seeded.activity;
+    }
+
+    setRawPlayer(p);
+    setRawQuests(q);
+    setRawActivity(a);
+    localStorage.setItem(TOKEN_KEY, "session_active");
+    setToken("session_active");
+    toast(`Welcome back, ${p.name}!`);
+  }
+
   function logout() {
-    localStorage.removeItem(TOKEN_KEY);
+    clearSession();
     setToken(null);
     resetGameState();
   }
 
-  // Everything the app needs after signing in or restoring a session.
-  const loadAll = useCallback(async () => {
-    const [p, q, s, b, a, w] = await Promise.all([
-      api.get("/player"),
-      api.get("/quests"),
-      api.get("/shop"),
-      api.get("/badges"),
-      api.get("/activity?limit=6"),
-      api.get("/player/week"),
-    ]);
-    setPlayer(p.data.player);
-    setQuests(q.data.quests);
-    setShopItems(s.data.items);
-    setBadges(b.data.badges);
-    setActivity(a.data.activity);
-    setWeek(w.data);
-  }, []);
-
-  // Lighter refresh after an action that only moves badges/activity/the week
-  // chart, not the whole page (the action itself already updated player/quests).
-  const refreshSideEffects = useCallback(async () => {
-    try {
-      const [b, a, w] = await Promise.all([
-        api.get("/badges"),
-        api.get("/activity?limit=6"),
-        api.get("/player/week"),
-      ]);
-      setBadges(b.data.badges);
-      setActivity(a.data.activity);
-      setWeek(w.data);
-    } catch {
-      // Non-critical — the next full reload will catch it back up.
-    }
-  }, []);
-
-  // On mount (and whenever the token changes), restore or clear the session.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      if (!token) {
-        resetGameState();
-        setReady(true);
-        return;
-      }
-      try {
-        await loadAll();
-      } catch {
-        localStorage.removeItem(TOKEN_KEY);
-        if (!cancelled) setToken(null);
-      } finally {
-        if (!cancelled) setReady(true);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token]);
-
-  // A token can also expire mid-session (see api/client.js's response interceptor).
-  useEffect(() => {
-    window.addEventListener(AUTH_EXPIRED_EVENT, logout);
-    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, logout);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  async function signup({ name, email, password }) {
-    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    const { data } = await api.post("/auth/signup", { name, email, password, timezone });
-    localStorage.setItem(TOKEN_KEY, data.token);
-    setPlayer(data.player);
-    setToken(data.token); // triggers loadAll() for quests/badges/shop/activity/week
-  }
-
-  async function login({ email, password }) {
-    const { data } = await api.post("/auth/login", { email, password });
-    localStorage.setItem(TOKEN_KEY, data.token);
-    setPlayer(data.player);
-    setToken(data.token);
-  }
-
-  async function deleteAccount() {
-    await api.delete("/player");
+  function deleteAccount() {
+    deleteLocalAccount();
     logout();
   }
 
-  async function completeQuest(questId) {
-    try {
-      const { data } = await api.post(`/quests/${questId}/complete`);
-      setQuests((list) => list.map((q) => (q.id === data.quest.id ? data.quest : q)));
-      setPlayer(data.player);
+  function completeQuest(questId) {
+    const targetQuest = rawQuests.find((q) => q.id === questId);
+    if (!targetQuest || targetQuest.done || !rawPlayer) return;
 
-      toast(`+${data.reward.xp} XP · +${data.reward.gold}g`);
-      if (data.leveledUp) {
-        toast(`Level up — you're now level ${data.newLevel}`);
-        setLevelUpModalLevel(data.newLevel || data.player.level);
-      }
-      announceBadges(data.newBadges);
+    const today = dayKey(new Date(), tz);
+    const reward = rewardFor(targetQuest.difficulty);
+    const xpOutcome = addXp(rawPlayer.level, rawPlayer.xp, reward.xp);
 
-      refreshSideEffects();
-    } catch (err) {
-      toast(apiMessage(err, "Couldn't complete that quest."), "error");
+    const prevCategoryDone = rawPlayer.catDone?.[targetQuest.category] ?? 0;
+    const prevAttr = rawPlayer.attrs?.[targetQuest.attribute] ?? 0;
+    const streakUpdate = applyCompletion(rawPlayer, today);
+
+    const nextPlayer = {
+      ...rawPlayer,
+      level: xpOutcome.level,
+      xp: xpOutcome.xp,
+      gold: (rawPlayer.gold ?? 0) + reward.gold,
+      totalDone: (rawPlayer.totalDone ?? 0) + 1,
+      streak: streakUpdate.streak,
+      longestStreak: streakUpdate.longestStreak,
+      lastCompletedDate: streakUpdate.lastCompletedDate,
+      attrs: {
+        ...rawPlayer.attrs,
+        [targetQuest.attribute]: prevAttr + 1,
+      },
+      catDone: {
+        ...rawPlayer.catDone,
+        [targetQuest.category]: prevCategoryDone + 1,
+      },
+    };
+
+    const nextQuests = rawQuests.map((q) =>
+      q.id === questId
+        ? {
+            ...q,
+            done: true,
+            completedDay: today,
+            completedAt: new Date().toISOString(),
+          }
+        : q
+    );
+
+    const newActivities = [
+      {
+        id: `act_${Date.now()}_q`,
+        type: "quest",
+        title: targetQuest.title,
+        reward: `+${reward.xp} XP · +${reward.gold}g`,
+        day: today,
+        createdAt: new Date().toISOString(),
+      },
+    ];
+
+    if (xpOutcome.leveledUp) {
+      newActivities.push({
+        id: `act_${Date.now()}_lvl`,
+        type: "levelup",
+        title: `Reached Level ${xpOutcome.level}!`,
+        reward: "Stat Boost",
+        day: today,
+        createdAt: new Date().toISOString(),
+      });
     }
+
+    const unlockedBadges = newlyUnlocked(
+      { player: rawPlayer, owned: rawPlayer.ownedFrames || [] },
+      { player: nextPlayer, owned: nextPlayer.ownedFrames || [] }
+    );
+
+    unlockedBadges.forEach((b, i) => {
+      newActivities.push({
+        id: `act_${Date.now()}_b_${i}`,
+        type: "badge",
+        title: `Earned ${b.name}`,
+        reward: b.hint,
+        day: today,
+        createdAt: new Date().toISOString(),
+      });
+    });
+
+    const nextActivity = [...newActivities, ...rawActivity];
+
+    setRawPlayer(nextPlayer);
+    setRawQuests(nextQuests);
+    setRawActivity(nextActivity);
+    saveStoredData({ player: nextPlayer, quests: nextQuests, activity: nextActivity });
+
+    toast(`+${reward.xp} XP · +${reward.gold}g`);
+    if (xpOutcome.leveledUp) {
+      toast(`Level up — you're now level ${xpOutcome.level}`);
+      setLevelUpModalLevel(xpOutcome.level);
+    }
+    announceBadges(unlockedBadges);
   }
 
-  async function addQuest(form) {
-    try {
-      const { data } = await api.post("/quests", form);
-      setQuests((list) => [data.quest, ...list]);
-      toast("Quest added");
-    } catch (err) {
-      toast(apiMessage(err, "Couldn't add that quest."), "error");
-    }
+  function addQuest(form) {
+    if (!rawPlayer) return;
+    const newQuest = {
+      id: `q_${Date.now()}`,
+      title: form.title,
+      category: form.category || "Study",
+      attribute: form.attribute || "Intellect",
+      difficulty: form.difficulty || "Normal",
+      repeat: form.repeat || "Daily quest",
+      dueDate: form.dueDate || null,
+      done: false,
+      completedDay: null,
+      completedAt: null,
+      createdAt: new Date().toISOString(),
+    };
+
+    const nextQuests = [newQuest, ...rawQuests];
+    setRawQuests(nextQuests);
+    saveStoredData({ quests: nextQuests });
+    toast("Quest added");
   }
 
-  async function purchase(itemId) {
-    const item = shopItems.find((i) => i.id === itemId);
-    if (item && player && player.gold < item.price) {
-      setGoldModalItem(item);
+  function purchase(itemId) {
+    const frame = getFrame(itemId);
+    if (!frame || !rawPlayer) return;
+
+    if (rawPlayer.gold < frame.price) {
+      setGoldModalItem(frame);
       return;
     }
 
-    try {
-      const { data } = await api.post(`/shop/${itemId}/buy`);
-      setPlayer(data.player);
-      setShopItems((list) => list.map((i) => (i.id === itemId ? data.item : { ...i, equipped: false })));
-      toast(`${data.item.name} purchased and equipped`);
-      announceBadges(data.newBadges);
-      refreshSideEffects();
-    } catch (err) {
-      if (err?.response?.data?.code === "INSUFFICIENT_GOLD" && item) {
-        setGoldModalItem(item);
-      } else {
-        toast(apiMessage(err, "Couldn't buy that frame."), "error");
-      }
+    const owned = rawPlayer.ownedFrames || [];
+    if (owned.includes(itemId)) {
+      equipFrame(itemId);
+      return;
     }
+
+    const nextOwned = [...owned, itemId];
+    const today = dayKey(new Date(), tz);
+    const nextPlayer = {
+      ...rawPlayer,
+      gold: rawPlayer.gold - frame.price,
+      ownedFrames: nextOwned,
+      equippedFrame: itemId,
+    };
+
+    const unlockedBadges = newlyUnlocked(
+      { player: rawPlayer, owned },
+      { player: nextPlayer, owned: nextOwned }
+    );
+
+    const newActivity = [
+      {
+        id: `act_${Date.now()}_buy`,
+        type: "purchase",
+        title: `Bought ${frame.name}`,
+        reward: `-${frame.price}g`,
+        day: today,
+        createdAt: new Date().toISOString(),
+      },
+      ...rawActivity,
+    ];
+
+    setRawPlayer(nextPlayer);
+    setRawActivity(newActivity);
+    saveStoredData({ player: nextPlayer, activity: newActivity });
+
+    toast(`${frame.name} purchased and equipped`);
+    announceBadges(unlockedBadges);
   }
 
-  // Click a worn frame again to take it off.
-  async function equipFrame(itemId) {
-    try {
-      const { data } = await api.post(`/shop/${itemId}/equip`);
-      setPlayer((p) => (p ? { ...p, equippedFrame: data.equippedFrame } : p));
-      setShopItems((list) => list.map((i) => ({ ...i, equipped: i.id === data.equippedFrame })));
-    } catch (err) {
-      toast(apiMessage(err, "Couldn't equip that frame."), "error");
-    }
+  function equipFrame(itemId) {
+    if (!rawPlayer) return;
+    const isEquipped = rawPlayer.equippedFrame === itemId;
+    const nextPlayer = {
+      ...rawPlayer,
+      equippedFrame: isEquipped ? null : itemId,
+    };
+
+    setRawPlayer(nextPlayer);
+    saveStoredData({ player: nextPlayer });
+    toast(isEquipped ? "Frame removed" : "Frame equipped");
   }
 
-  // Name/email fields call this on every keystroke, same as the old dummy version,
-  // so this debounces the actual PATCH instead of firing one per character.
   function updatePlayer(changes) {
-    setPlayer((p) => (p ? { ...p, ...changes } : p));
-    pendingPatch.current = { ...pendingPatch.current, ...changes };
-    clearTimeout(patchTimer.current);
-    patchTimer.current = setTimeout(async () => {
-      const body = pendingPatch.current;
-      pendingPatch.current = {};
-      if (!Object.keys(body).length) return;
-      try {
-        const { data } = await api.patch("/player", body);
-        setPlayer(data.player);
-      } catch (err) {
-        // Likely a mid-typing invalid value (e.g. an incomplete email) — the
-        // next pause sends the full value, so only surface a real failure.
-        if (err?.response?.status !== 400) toast(apiMessage(err, "Couldn't save your changes."), "error");
-      }
-    }, 600);
+    if (!rawPlayer) return;
+    const nextPlayer = { ...rawPlayer, ...changes };
+    setRawPlayer(nextPlayer);
+    saveStoredData({ player: nextPlayer });
   }
 
-  async function toggleSetting(key) {
-    const value = !player?.settings?.[key];
-    setPlayer((p) => (p ? { ...p, settings: { ...p.settings, [key]: value } } : p));
-    try {
-      const { data } = await api.patch("/player", { settings: { [key]: value } });
-      setPlayer(data.player);
-    } catch (err) {
-      toast(apiMessage(err, "Couldn't save that setting."), "error");
-    }
+  function toggleSetting(key) {
+    if (!rawPlayer) return;
+    const current = rawPlayer.settings?.[key] ?? false;
+    const nextPlayer = {
+      ...rawPlayer,
+      settings: {
+        ...rawPlayer.settings,
+        [key]: !current,
+      },
+    };
+    setRawPlayer(nextPlayer);
+    saveStoredData({ player: nextPlayer });
+    toast("Setting updated");
   }
 
   const value = {
     ready,
-    isAuthed: !!token,
+    isAuthed: Boolean(token),
     player,
     quests,
     activity,
@@ -288,4 +391,3 @@ export function useGame() {
   if (!ctx) throw new Error("useGame must be used inside <GameProvider>");
   return ctx;
 }
-

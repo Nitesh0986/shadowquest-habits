@@ -4,9 +4,9 @@
   "private": true,
   "description": "ShadowQuest Gamified Habit RPG",
   "scripts": {
-    "postinstall": "cd backend && npm install",
-    "build": "cd backend && npm install",
-    "start": "cd backend && node server.js"
+    "build": "cd frontend && npm install && npm run build",
+    "dev": "cd frontend && npm run dev",
+    "preview": "cd frontend && npm run preview"
   },
   "engines": {
     "node": ">=18.18"
